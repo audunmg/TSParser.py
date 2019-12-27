@@ -57,18 +57,17 @@ def ts2second(timestamp):
     return timestamp/90000.0
 
 
-class TSHdrFixedPart(ctypes.LittleEndianStructure):
+class TSHdrFixedPart(ctypes.BigEndianStructure):
     _pack_ = 1  # 1字节对齐
     _fields_ = [
         ('sync_byte', ctypes.c_uint8, 8),
-        ('pid12_8', ctypes.c_uint8, 5),
-        ('transport_priority', ctypes.c_uint8, 1),
-        ('payload_unit_start_indicator', ctypes.c_uint8, 1),
         ('transport_error_indicator', ctypes.c_uint8, 1),
-        ('pid7_0', ctypes.c_uint8, 8),
-        ('continuity_counter', ctypes.c_uint8, 4),
-        ('adaptation_field_control', ctypes.c_uint8, 2),
+        ('payload_unit_start_indicator', ctypes.c_uint8, 1),
+        ('transport_priority', ctypes.c_uint8, 1),
+        ('pid', ctypes.c_uint16, 13),
         ('transport_scrambling_control', ctypes.c_uint8, 2),
+        ('adaptation_field_control', ctypes.c_uint8, 2),
+        ('continuity_counter', ctypes.c_uint8, 4),
     ]
 
 
@@ -326,7 +325,7 @@ class TSPacket:
             return False
 
         self.ts_header = TSHdrFixedPart.from_buffer_copy(self.buf[0:sizeof(TSHdrFixedPart)])
-        self.pid = mk_word(self.ts_header.pid12_8, self.ts_header.pid7_0)
+        self.pid = self.ts_header.pid
         self.cc = self.ts_header.continuity_counter
         if self.pid == PID_NULL:
             return True
@@ -547,17 +546,62 @@ class TSParser:
     def parse_NIT(self, payload):
         nit = NITHdrFixedPart.from_buffer_copy(payload)
         tablespace = payload[sizeof(NITHdrFixedPart):-4]
+        if nit.network_descriptors_length != 0:
+            return {}
 
         pos = 0
         streams = {}
         while pos < len(tablespace):
             streamtable = NITStreamTable.from_buffer_copy(tablespace[pos:])
             pos += sizeof(NITStreamTable)
-
             streams[streamtable.transport_stream_id] = self.parse_streamNITstreamTable(tablespace[pos:pos+streamtable.length])
             #print(streams[streamtable.transport_stream_id])
             pos += streamtable.length
+            #import json
+            #print(json.dumps(streams, indent=2))
+            #print(hex(pos))
         return streams
+    def getMPEGServiceType(self,servicetype):
+        servicetypes = {
+                0x00: "reserved for future use",
+                0x01: "digital television service",
+                0x02: "digital radio sound service",
+                0x03: "Teletext service",
+                0x04: "NVOD reference service",
+                0x05: "NVOD time-shifted service",
+                0x06: "mosaic service",
+                0x07: "FM radio service",
+                0x08: "DVB SRM service",
+                0x09: "reserved for future use",
+                0x0A: "advanced codec digital radio sound service",
+                0x0B: "H.264/AVC mosaic service",
+                0x0C: "data broadcast service",
+                0x0D: "reserved for Common Interface Usage",
+                0x0E: "RCS Map",
+                0x0F: "RCS FLS",
+                0x10: "DVB MHP service",
+                0x11: "MPEG-2 HD digital television service",
+                0x16: "H.264/AVC SD digital television service",
+                0x17: "H.264/AVC SD NVOD time-shifted service",
+                0x18: "H.264/AVC SD NVOD reference service",
+                0x19: "H.264/AVC HD digital television service",
+                0x1A: "H.264/AVC HD NVOD time-shifted service",
+                0x1B: "H.264/AVC HD NVOD reference service",
+                0x1C: "H.264/AVC frame compatible plano-stereoscopic HD digital television service",
+                0x1D: "H.264/AVC frame compatible plano-stereoscopic HD NVOD time-shifted service",
+                0x1E: "H.264/AVC frame compatible plano-stereoscopic HD NVOD reference service",
+                0x1F: "HEVC digital television service",
+                0x20: "HEVC UHD digital television service",
+                0xFF: "reserved for future use ",
+                }
+        if servicetype >= 0x12 and servicetype <= 0x15:
+            return "reserved for future use"
+        elif servicetype >= 0x21 and servicetype <= 0x7F:
+            return "reserved for future use"
+        elif servicetype >= 0x80 and servicetype <= 0xFE:
+            return "unknown user defined"
+        else:
+            return servicetypes[servicetype]
 
     def parse_streamNITstreamTable(self,payload):
         pos = 0
@@ -569,19 +613,8 @@ class TSParser:
                 pos += 2
                 stream['services'] = {}
                 for n in range(int(payload[pos-1] / 3)):
-                    if payload[pos+(n*3)+2] == 0x1:
-                        stream['services'][ payload[pos+(n*3):pos+2+(n*3)].hex() ] = 'digital television service'
-                    elif payload[pos+(n*3)+2] == 0x19:
-                        stream['services'][ payload[pos+(n*3):pos+2+(n*3)].hex() ] = 'advanced codec HD digital television service'
-                    elif payload[pos+(n*3)+2] == 0x2:
-                        stream['services'][ payload[pos+(n*3):pos+2+(n*3)].hex() ] = 'digital radio sound service'
-                    elif payload[pos+(n*3)+2] == 0xa:
-                        stream['services'][ payload[pos+(n*3):pos+2+(n*3)].hex() ] = 'advanced codec digital radio sound service'
-                    else:
-                        print ("Unknown service type:",  hex(payload[pos+(n*3)+2]) )
-                        stream['services'][ payload[pos+(n*3):pos+2+(n*3)].hex() ] = hex(payload[pos+(n*3)+2])
-
-                pos += 1 + payload[pos]
+                    stream['services'][ payload[pos+(n*3):pos+2+(n*3)].hex() ] = self.getMPEGServiceType(payload[pos+(n*3)+2])
+                pos += payload[pos -1] 
             elif payload[pos] == 0x5f:
                 # who knows what this stuff is
                 pos += 1
@@ -592,14 +625,28 @@ class TSParser:
                 stuff = payload[pos+1:pos+1+(payload[pos])]
                 stream['ipaddress'] = str(ipaddress.ip_address(stuff[3:7]))
                 stream['port'] = (stuff[7] << 8)  + stuff[8]
-                pos += len(stuff)
+                pos += payload[pos] + 1
+            elif pos == (len(payload) - 4):
+                print("CRC")
+                pos += 4
             else:
+                print("pos %d, len %d" % (pos, len(payload)))
+                print(payload)
+                raise Exception("Shitty packet","Unknown stuff %s len %d" % (hex(payload[pos]), payload[pos+1]))
+                
                 pos += 1
+        #import json
+        #print(json.dumps(stream, indent=2))
         return stream
 
         
 
-               
+    def tableparse(self,pid,payload):
+        if pid == 'NIT':
+            nit = self.parse_NIT(payload)
+            #print(nit)
+            return nit
+        return {}
 
 
     def parse(self):
@@ -616,9 +663,11 @@ class TSParser:
         need['EIT'] = 0
         need['SDT'] = 0
         need['NIT'] = 0
-        eitbuffer = b''
-        sdtbuffer = b''
-        nitbuffer = b''
+        pbuf = {}
+        pbuf['EIT'] = b''
+        pbuf['SDT'] = b''
+        pbuf['NIT'] = b''
+        cont = {}
         streams = {}
         try:
             while True:
@@ -638,6 +687,11 @@ class TSParser:
 
                     pkt = TSPacket(buf[i:i+TS_PKT_LEN])
                     success = pkt.parse()
+                    PID = { 'SDT': PID_SDT,
+                            'NIT': PID_NIT,
+                            'EIT': PID_EIT,
+                            }
+                    
                     if pkt.pid == PID_SDT and need['SDT'] > 0:
                         pkt.fragment = True
                     elif pkt.pid == PID_NIT and need['NIT'] > 0:
@@ -646,66 +700,44 @@ class TSParser:
                         pkt.fragment = True
 
                     if pkt.fragment:
-                        if pkt.pid == PID_SDT and need['SDT'] > 0:
-                            pkt.fragment = True
-                            if len(pkt.payload) <= need['SDT']:
-                              sdtbuffer += pkt.payload
-                              need['SDT'] -= len(pkt.payload)
-                            else:
-                              sdtbuffer += pkt.payload[0:(need['SDT'] )]
-                              need['SDT'] = 0
-                            if need['SDT'] <= 0:
-                                print ("Completed SDT packet of %d bytes" % len(sdtbuffer) )
-                                sdtbuffer = b''
-                                need['SDT'] = 0
+                        for pid in PID.keys():
+                            if pkt.pid == PID[pid] and need[pid] > 0:
+                                pkt.fragment = True
+                                if pkt.cc == ((cont[pid]+1)&0xf):
+                                    print("Correct cont", end='')
+                                    cont[pid] = pkt.cc
+                                else:
+                                    print("\033[31mlost %s package\033[0m, expected %d got %d, discarding partial package" % (pid, cont[pid]+1, pkt.cc))
+                                    need[pid] = 0
+                                    pbuf[pid] = b''
+                                    break
+                                if len(pkt.payload) <= need[pid]:
+                                  pbuf[pid] += pkt.payload
+                                  need[pid] -= len(pkt.payload)
+                                else:
+                                  pbuf[pid] += pkt.payload[0:(need[pid] )]
+                                  need[pid] = 0
+                                if need[pid] <= 0:
+                                    print ('PktNo: %08d, Offset: 0x%08X, ' % (self.pkt_no, cur_pos), end='')
+                                    print ("\033[92mCompleted\033[0m %s packet of \033[1m%d\033[0m bytes" % (pid, len(pbuf[pid])) )
+                                    table = self.tableparse(pid, pbuf[pid])
+                                    for key in table.keys():
+                                        streams[key] = table[key]
+                                        
+                                    if pid == 'NIT':
+                                            import json
+                                            #print(json.dumps(streams, indent=2))
+                                    pbuf[pid] = b''
+                                    need[pid] = 0
+                    else:
+                        for pid in PID.keys():
+                            if pkt.pid == PID[pid]:
+                                print ("\033[1;31m%s\033[0m Len: \033[1m%d\033[0m payload len: %d" % ( pid, pkt.length, len(pkt.payload) ) )
+                                if pkt.length > len(pkt.payload[1:]):
+                                    pbuf[pid] = pkt.payload[1:]
+                                    cont[pid] = pkt.cc
+                                    need[pid] = pkt.length - len(pkt.payload[1:])
 
-                        elif pkt.pid == PID_NIT and need['NIT'] > 0:
-                            pkt.fragment = True
-                            if len(pkt.payload) <= need['NIT']:
-                              nitbuffer += pkt.payload
-                              need['NIT'] -= len(pkt.payload)
-                            else:
-                              nitbuffer += pkt.payload[0:(need['NIT'] )]
-                              need['NIT'] = 0
-                            if need['NIT'] <= 0:
-                                print ("Completed NIT packet of %d bytes" % len(nitbuffer))
-                                nit = self.parse_NIT(nitbuffer)
-                                for key in nit.keys():
-                                    streams[key] = nit[key]
-                                nitbuffer = b''
-                                need['NIT'] = 0
-
-                        elif pkt.pid == PID_EIT and need['EIT'] > 0:
-                            pkt.fragment = True
-                            if len(pkt.payload) <= need['EIT']:
-                              eitbuffer += pkt.payload
-                              need['EIT'] -= len(pkt.payload)
-                            else:
-                              eitbuffer += pkt.payload[0:(need['EIT'] )]
-                              need['EIT'] = 0
-                            if need['EIT'] <= 0:
-                                print ("Completed EIT packet of %d bytes" % len(eitbuffer))
-                                eitbuffer = b''
-                                need['EIT'] = 0
-                        else:
-                            print ("Unowned fragment")
-                    elif pkt.pid == PID_NIT and not pkt.fragment:
-                        print ("NIT Len: %d payload len: %d" % ( pkt.length, len(pkt.payload) ) )
-                        if pkt.length > len(pkt.payload[1:]):
-                            nitbuffer = pkt.payload[1:]
-                            need['NIT'] = pkt.length - len(pkt.payload[1:])
-                    elif pkt.pid == PID_SDT and not pkt.fragment:
-                        print ("SDT Len: %d payload len: %d" % ( pkt.length, len(pkt.payload) ) )
-                        if pkt.length > len(pkt.payload):
-                            sdtbuffer = pkt.payload[1:]
-                            need['SDT'] = pkt.length - len(pkt.payload)
-                    elif pkt.pid == PID_EIT and not pkt.fragment:
-                        #print pkt.length
-                        print ("EIT Len: %d payload len: %d" % ( pkt.length, len(pkt.payload) ) )
-                        if pkt.length > len(pkt.payload[1:]):
-                            eitbuffer += pkt.payload[1:]
-                            need['EIT'] = pkt.length - len(pkt.payload)
-                        #pkt.parse()
                     if success and self.__is_show_pkt(pkt):
                         self.__print_packet_info(pkt, cur_pos)
                         cur_pos += TS_PKT_LEN
@@ -713,7 +745,7 @@ class TSParser:
 
             print ('Parse file complete!')
             import json
-            print(json.dumps(nit, indent=2))
+            print(json.dumps(streams, indent=2))
         except IOError as e:
             errno, strerror = e.args
             print ('###### Read file error! error({0}): {1}'.format(errno, strerror) )
