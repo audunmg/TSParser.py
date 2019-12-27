@@ -227,8 +227,6 @@ class NITHdrFixedPart(ctypes.BigEndianStructure):
         ('last_section_number', ctypes.c_uint8, 8),
         ('reserved2', ctypes.c_uint8, 4),
         ('network_descriptors_length', ctypes.c_uint16, 12),
-        ('reserved2', ctypes.c_uint8, 4),
-        ('transport_stream_loop_length', ctypes.c_uint16, 12),
         ]
 
 
@@ -543,24 +541,30 @@ class TSParser:
         if grep:
             self.grep = grep
 
-    def parse_NIT(self, payload):
+    def parseNIT(self, payload):
         nit = NITHdrFixedPart.from_buffer_copy(payload)
-        tablespace = payload[sizeof(NITHdrFixedPart):-4]
+        pos = sizeof(NITHdrFixedPart)
         if nit.network_descriptors_length != 0:
-            return {}
+            nds = self.parseDescriptors(payload[pos:nit.network_descriptors_length])
+            pos += nit.network_descriptors_length + 2
+            #return {}
+        else:
+            pos += 2
+        tablespace = payload[pos:-4]
 
         pos = 0
         streams = {}
         while pos < len(tablespace):
             streamtable = NITStreamTable.from_buffer_copy(tablespace[pos:])
             pos += sizeof(NITStreamTable)
-            streams[streamtable.transport_stream_id] = self.parse_streamNITstreamTable(tablespace[pos:pos+streamtable.length])
+            streams[streamtable.transport_stream_id] = self.parseNITstreamTable(tablespace[pos:pos+streamtable.length])
             #print(streams[streamtable.transport_stream_id])
             pos += streamtable.length
             #import json
             #print(json.dumps(streams, indent=2))
             #print(hex(pos))
         return streams
+
     def getMPEGServiceType(self,servicetype):
         servicetypes = {
                 0x00: "reserved for future use",
@@ -603,7 +607,35 @@ class TSParser:
         else:
             return servicetypes[servicetype]
 
-    def parse_streamNITstreamTable(self,payload):
+    def parseDescriptors(self,payload):
+        pos = 0
+        descriptors = {}
+        import json
+        while pos < len(payload):
+            a = self.getMPEGDescriptor( payload[pos: pos+(payload[pos+1] + 2 ) ])
+            for key in a.keys():
+                descriptors[key] = a[key]
+            pos += 2 + payload[pos+1]
+        return descriptors
+
+
+
+
+
+    def getMPEGDescriptor(self,payload):
+        if payload[0] == 0x40:
+            return { 'network name': payload[2:].decode(errors='ignore') }
+        elif payload[0] == 0x5b:
+            return { 'multilingual network name': payload[2:].decode(errors='ignore') }
+        elif payload[0] == 0x5f:
+            return { 'private_data': payload[2:].decode(errors='ignore') }
+        elif payload[0] == 0x4a:
+            return { 'linkage_descriptor': payload[2:].decode(errors='ignore') } 
+        else:
+            return { hex(payload[0]): payload[2:].decode(errors='ignore') }
+
+
+    def parseNITstreamTable(self,payload):
         pos = 0
         stream = {}
 
@@ -643,9 +675,12 @@ class TSParser:
 
     def tableparse(self,pid,payload):
         if pid == 'NIT':
-            nit = self.parse_NIT(payload)
+            nit = self.parseNIT(payload)
             #print(nit)
             return nit
+        if pid == 'SDT':
+            sdt = {}
+            return sdt
         return {}
 
 
