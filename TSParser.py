@@ -14,6 +14,8 @@ MAX_CHECK_PKT_NUM = 3
 # PID type
 PID_PAT, PID_NULL, PID_UNSPEC = 0x0000, 0x1fff, 0xffff
 PID_EIT, PID_SDT, PID_NIT, PID_TDT = 0x0012, 0x0011, 0x0010, 0x0014
+PID_CUSTOM = 0x0021
+PID = ( PID_SDT, PID_NIT, PID_EIT, PID_CUSTOM, PID_TDT, )
 # Stream id
 PES_STREAM_VIDEO, PES_STREAM_AUDIO = 0xE0, 0xC0
 # Video stream type
@@ -230,6 +232,14 @@ class NITHdrFixedPart(ctypes.BigEndianStructure):
         ]
 
 
+class TableHdrFixedPart(ctypes.BigEndianStructure):
+    _pack_ = 1
+    _fields_ = [
+        ('table_id', ctypes.c_uint8, 8),
+        ('section_syntax_indicator', ctypes.c_uint8, 1),
+        ('reserved1', ctypes.c_uint8, 3),
+        ('length', ctypes.c_uint16, 12),
+        ]
 
 class SDTHdrFixedPart(ctypes.BigEndianStructure):
     _pack_ = 1
@@ -275,6 +285,19 @@ class NITStreamTable(ctypes.BigEndianStructure):
         ('reserved1', ctypes.c_uint8, 4),
         ('length', ctypes.c_uint16, 12),
         ]
+
+class SDTServiceTable(ctypes.BigEndianStructure):
+    _pack_ = 1
+    _fields_ = [
+        ('service_id', ctypes.c_uint16, 16),
+        ('reserved', ctypes.c_uint8, 6),
+        ('EIT_schedule_flag', ctypes.c_uint8, 1),
+        ('EIT_present_following_flag', ctypes.c_uint8, 1),
+        ('running_status', ctypes.c_uint8, 3),
+        ('free_CA_mode', ctypes.c_uint8, 1),
+        ('descriptors_loop_length', ctypes.c_uint16, 12),
+    ]
+
 
 
 
@@ -339,6 +362,8 @@ class TSPacket:
             self.__parse_nit()
         elif self.is_eit() and not self.fragment:
             self.__parse_eit()
+        elif self.pid in PID and not self.fragment:
+            self.__parse_table()
         elif self.is_pmt():
             self.__parse_pmt()
         elif self.pid == TSPacket.pid_map['PCR']:
@@ -347,7 +372,9 @@ class TSPacket:
         if self.__has_payload():
 
             self.__parse_pes()
-
+        if self.length == 0:
+            self.fragment = True
+            return False
         return True
 
     def is_pat(self):
@@ -368,7 +395,7 @@ class TSPacket:
 
     def is_tdt(self):
         return PID_TDT == self.pid
- 
+
     def is_pmt(self):
         return (PID_UNSPEC != self.pid) and (TSPacket.pid_map['PMT'] == self.pid)
 
@@ -487,6 +514,11 @@ class TSPacket:
         eit = EITHdrFixedPart.from_buffer_copy(self.buf[eit_pos:section_pos])
         self.length = eit.length
 
+    def __parse_table(self):
+        pos = self.__get_table_start_pos()
+        table = TableHdrFixedPart.from_buffer_copy(self.buf[pos:])
+        self.length = table.length
+
 
     def __parse_pmt(self):
         pmt_pos = self.__get_table_start_pos()
@@ -541,13 +573,43 @@ class TSParser:
         if grep:
             self.grep = grep
 
+    def tableparse(self,pid,payload):
+        tableid = payload[0]
+        if pid == PID_NIT:
+            nit = self.parseNIT(payload[0:-3])
+            return nit
+        if pid == PID_SDT:
+            if tableid == 0x46 or tableid == 0x42:
+                sdt = self.parseSDT(payload[0:-4])
+                return sdt
+        if pid == PID_EIT:
+            if tableid == 0x00:
+                eit = {}
+                return eit
+
+        return {}
+
+
+    def parseSDT(self,payload):
+        sdt = SDTHdrFixedPart.from_buffer_copy(payload)
+        pos = sizeof(SDTHdrFixedPart)
+        tablespace = payload[pos:]
+        pos = 0
+        services = {}
+        while pos < len(tablespace):
+            servicetable = SDTServiceTable.from_buffer_copy(tablespace[pos:])
+            pos += sizeof(SDTServiceTable)
+            descriptors = tablespace[ pos:(pos+servicetable.descriptors_loop_length)]
+            services[hex(servicetable.service_id)] = self.parseDescriptors(descriptors)
+            pos += servicetable.descriptors_loop_length
+        return services
+
     def parseNIT(self, payload):
         nit = NITHdrFixedPart.from_buffer_copy(payload)
         pos = sizeof(NITHdrFixedPart)
         if nit.network_descriptors_length != 0:
             nds = self.parseDescriptors(payload[pos:nit.network_descriptors_length])
             pos += nit.network_descriptors_length + 2
-            #return {}
         else:
             pos += 2
         tablespace = payload[pos:-4]
@@ -557,12 +619,8 @@ class TSParser:
         while pos < len(tablespace):
             streamtable = NITStreamTable.from_buffer_copy(tablespace[pos:])
             pos += sizeof(NITStreamTable)
-            streams[streamtable.transport_stream_id] = self.parseNITstreamTable(tablespace[pos:pos+streamtable.length])
-            #print(streams[streamtable.transport_stream_id])
+            streams[hex(streamtable.transport_stream_id)] = self.parseNITstreamTable(tablespace[pos:pos+streamtable.length])
             pos += streamtable.length
-            #import json
-            #print(json.dumps(streams, indent=2))
-            #print(hex(pos))
         return streams
 
     def getMPEGServiceType(self,servicetype):
@@ -610,7 +668,6 @@ class TSParser:
     def parseDescriptors(self,payload):
         pos = 0
         descriptors = {}
-        import json
         while pos < len(payload):
             a = self.getMPEGDescriptor( payload[pos: pos+(payload[pos+1] + 2 ) ])
             for key in a.keys():
@@ -623,16 +680,118 @@ class TSParser:
 
 
     def getMPEGDescriptor(self,payload):
-        if payload[0] == 0x40:
-            return { 'network name': payload[2:].decode(errors='ignore') }
+        descriptortypes = {
+            0x40: 'network_name',
+            0x41: 'service_list',
+            0x42: 'stuffing',
+            0x43: 'satellite_delivery_system',
+            0x44: 'cable_delivery_system',
+            0x45: 'VBI_data',
+            0x46: 'VBI_teletext',
+            0x47: 'bouquet_name',
+            0x48: 'service',
+            0x49: 'country_availability',
+            0x4a: 'linkage',
+            0x4b: 'NVOD_reference',
+            0x4c: 'time_shifted_service',
+            0x4d: 'short_event',
+            0x4e: 'extended_event',
+            0x4f: 'time_shifted_event',
+            0x50: 'component',
+            0x51: 'mosaic',
+            0x52: 'stream_identifier',
+            0x53: 'CA_identifier',
+            0x54: 'content',
+            0x55: 'parental_rating',
+            0x56: 'teletext',
+            0x57: 'telephone',
+            0x58: 'local_time_offset',
+            0x59: 'subtitling',
+            0x5a: 'terrestrial_delivery_system',
+            0x5b: 'multilingual_network_name',
+            0x5c: 'multilingual_bouquet_name',
+            0x5d: 'multilingual_service_name',
+            0x5e: 'multilingual_component',
+            0x5f: 'private_data',
+            0x60: 'service_move',
+            0x61: 'short_smoothing_buffer',
+            0x62: 'frequency_list',
+            0x63: 'partial_transport_stream',
+            0x64: 'data_broadcast',
+            0x65: 'scrambling',
+            0x66: 'data_broadcast_id',
+            0x67: 'transport_stream',
+            0x68: 'DSNG',
+            0x69: 'PDC',
+            0x6a: 'AC-3',
+            0x6b: 'ancillary_data',
+            0x6c: 'cell_list',
+            0x6d: 'cell_frequency_link',
+            0x6e: 'announcement_support',
+            0x6f: 'application_signalling',
+            0x70: 'adaptation_field_data',
+            0x71: 'service_identifier',
+            0x72: 'service_availability',
+            0x73: 'default_authority',
+            0x74: 'related_content',
+            0x75: 'TVA_id',
+            0x76: 'content_identifier',
+            0x77: 'time_slice_fec_identifier',
+            0x78: 'ECM_repetition_rate',
+            0x79: 'S2_satellite_delivery_system',
+            0x7a: 'enhanced_AC-3',
+            0x7b: 'DTS',
+            0x7c: 'AAC',
+            0x7d: 'XAIT location',
+            0x7e: 'FTA_content_management',
+            0x7f: 'extension',
+            }
+        if payload[0] == 0x40: # chars
+            return { descriptortypes[payload[0]]: self.decode_text(payload[2:]) }
+        elif payload[0] == 0x48: # Service descriptor
+            return {
+                    'service_type': self.getMPEGServiceType(payload[2]),
+                    'service_provider_name': self.decode_text( payload[4:(4+payload[3])]),
+                    'service_name': self.decode_text( payload[(5+payload[3]):] )
+                    }
         elif payload[0] == 0x5b:
-            return { 'multilingual network name': payload[2:].decode(errors='ignore') }
-        elif payload[0] == 0x5f:
-            return { 'private_data': payload[2:].decode(errors='ignore') }
-        elif payload[0] == 0x4a:
-            return { 'linkage_descriptor': payload[2:].decode(errors='ignore') } 
+            return { 'multilingual_network_name': payload[2:].decode(errors='ignore') }
         else:
-            return { hex(payload[0]): payload[2:].decode(errors='ignore') }
+            if payload[0] in list(descriptortypes.keys()):
+                return { descriptortypes[payload[0]]: payload[2:].decode(errors='ignore') }
+            else:
+                if payload[1] == 1:
+                    return { hex(payload[0]): payload[2] }
+                else:
+                    return { hex(payload[0]): payload[2:].decode(errors='ignore') }
+
+    # From https://github.com/roginvs/eit2xmltv.git:
+    def decode_text(self,text):
+        CHARACTER_CODING_TABLE = {0x01:'ISO-8859-5',0x02:'ISO-8859-6',0x03:'ISO-8859-7',0x04:'ISO-8859-8',
+                                  0x05:'ISO-8859-9',0x06:'ISO-8859-10',0x07:'ISO-8859-11',0x08:None,
+                                  0x09:'ISO-8859-13',0x0A:'ISO-8859-14',0x0B:'ISO-8859-15',
+                                  0x0C:None,0x0D:None,0x0E:None,0x0F:None,
+                                  0x10:None,0x11:'utf_16_be',0x12:'euc_kr',0x13:'gb2312',
+                                  0x14:'big5',0x15:'UTF-8', # FIXME: Fix 0x10
+                                  0x16:None,0x17:None,0x18:None,0x19:None,0x1A:None,0x1B:None,
+                                  0x1C:None,0x1D:None,0x1E:None,
+                                  0x1F:None
+                                  }
+
+        if text:
+            try:
+                first_character_number = text[0]
+                if (first_character_number >= 0x20 and first_character_number <= 0xFF):
+                    text = text.decode('latin1')
+                elif not CHARACTER_CODING_TABLE[first_character_number] is None:
+                    text = text[1:].decode(CHARACTER_CODING_TABLE[first_character_number])
+                else:
+                    text = u'error'
+            except UnicodeDecodeError:
+                text = u'error_decoding'
+        else:
+            text = u''
+        return text
 
 
     def parseNITstreamTable(self,payload):
@@ -640,13 +799,14 @@ class TSParser:
         stream = {}
 
         while pos < len(payload):
+            print(payload[pos:])
             if payload[pos] == 0x41:
                 # oh this turned out uglier than expected
                 pos += 2
                 stream['services'] = {}
                 for n in range(int(payload[pos-1] / 3)):
                     stream['services'][ payload[pos+(n*3):pos+2+(n*3)].hex() ] = self.getMPEGServiceType(payload[pos+(n*3)+2])
-                pos += payload[pos -1] 
+                pos += payload[pos -1]
             elif payload[pos] == 0x5f:
                 # who knows what this stuff is
                 pos += 1
@@ -665,23 +825,9 @@ class TSParser:
                 print("pos %d, len %d" % (pos, len(payload)))
                 print(payload)
                 raise Exception("Shitty packet","Unknown stuff %s len %d" % (hex(payload[pos]), payload[pos+1]))
-                
+
                 pos += 1
-        #import json
-        #print(json.dumps(stream, indent=2))
         return stream
-
-        
-
-    def tableparse(self,pid,payload):
-        if pid == 'NIT':
-            nit = self.parseNIT(payload)
-            #print(nit)
-            return nit
-        if pid == 'SDT':
-            sdt = {}
-            return sdt
-        return {}
 
 
     def parse(self):
@@ -694,18 +840,35 @@ class TSParser:
         print('Seek to first packet, offset: 0x%08X' % cur_pos)
 
         read_len = MAX_READ_PKT_NUM*TS_PKT_LEN
+        pid_name = {
+            PID_SDT: 'SDT',
+            PID_NIT: 'NIT',
+            PID_EIT: 'EIT',
+            0x0021: 'secret',
+            PID_TDT: 'TDT',
+            }
         need = {}
-        need['EIT'] = 0
-        need['SDT'] = 0
-        need['NIT'] = 0
         pbuf = {}
-        pbuf['EIT'] = b''
-        pbuf['SDT'] = b''
-        pbuf['NIT'] = b''
         cont = {}
         streams = {}
+        for pid in PID:
+            need[pid] = 0
+            pbuf[pid] = 0
+            streams[pid] = {}
+
+        need[PID_EIT] = 0
+        need[PID_SDT] = 0
+        need[PID_NIT] = 0
+        pbuf[PID_EIT] = b''
+        pbuf[PID_SDT] = b''
+        pbuf[PID_NIT] = b''
+        streams = { PID_NIT: {}, PID_SDT: {}, PID_EIT: {} }
+
         try:
+            import json
+            f = open('data.json','wb')
             while True:
+                f.write(json.dumps(streams, indent=2).encode())
                 buf = self.fd.read(read_len)
                 if not buf:
                     break
@@ -722,21 +885,13 @@ class TSParser:
 
                     pkt = TSPacket(buf[i:i+TS_PKT_LEN])
                     success = pkt.parse()
-                    PID = { 'SDT': PID_SDT,
-                            'NIT': PID_NIT,
-                            'EIT': PID_EIT,
-                            }
-                    
-                    if pkt.pid == PID_SDT and need['SDT'] > 0:
-                        pkt.fragment = True
-                    elif pkt.pid == PID_NIT and need['NIT'] > 0:
-                        pkt.fragment = True
-                    elif pkt.pid == PID_EIT and need['EIT'] > 0:
-                        pkt.fragment = True
+                    for pid in PID:
+                        if pkt.pid == pid and need[pid] > 0:
+                            pkt.fragment = True
 
                     if pkt.fragment:
-                        for pid in PID.keys():
-                            if pkt.pid == PID[pid] and need[pid] > 0:
+                        for pid in PID:
+                            if pkt.pid == pid and need[pid] > 0:
                                 pkt.fragment = True
                                 if pkt.cc == ((cont[pid]+1)&0xf):
                                     print("Correct cont", end='')
@@ -750,28 +905,38 @@ class TSParser:
                                   pbuf[pid] += pkt.payload
                                   need[pid] -= len(pkt.payload)
                                 else:
-                                  pbuf[pid] += pkt.payload[0:(need[pid] )]
+                                  pbuf[pid] += pkt.payload[0:(need[pid]+3 )]
                                   need[pid] = 0
                                 if need[pid] <= 0:
                                     print ('PktNo: %08d, Offset: 0x%08X, ' % (self.pkt_no, cur_pos), end='')
-                                    print ("\033[92mCompleted\033[0m %s packet of \033[1m%d\033[0m bytes" % (pid, len(pbuf[pid])) )
+                                    print ("\033[92mCompleted\033[0m %s packet of \033[1m%d\033[0m bytes" % (pid_name[pid], len(pbuf[pid])) )
                                     table = self.tableparse(pid, pbuf[pid])
+                                    print(table)
                                     for key in table.keys():
-                                        streams[key] = table[key]
-                                        
-                                    if pid == 'NIT':
-                                            import json
-                                            #print(json.dumps(streams, indent=2))
+                                        streams[pid][key] = table[key]
+
                                     pbuf[pid] = b''
                                     need[pid] = 0
                     else:
-                        for pid in PID.keys():
-                            if pkt.pid == PID[pid]:
-                                print ("\033[1;31m%s\033[0m Len: \033[1m%d\033[0m payload len: %d" % ( pid, pkt.length, len(pkt.payload) ) )
+                        for pid in PID:
+                            if pkt.pid == pid:
+                                print ("\033[1;31m%s\033[0m Len: \033[1m%d\033[0m payload len: %d" % ( pid_name[pid], pkt.length, len(pkt.payload) ) )
                                 if pkt.length > len(pkt.payload[1:]):
                                     pbuf[pid] = pkt.payload[1:]
                                     cont[pid] = pkt.cc
                                     need[pid] = pkt.length - len(pkt.payload[1:])
+                                else:
+
+                                    load = pkt.payload[1:(pkt.length)+4]
+                                    #print(load)
+                                    #print("len load %d, pkt len %d buf len %d" % (len(load), pkt.length, len(pkt.buf)))
+                                    table = self.tableparse(pid, load )
+                                    import json
+                                    print(table)
+                                    for key in table.keys():
+                                        streams[pid][key] = table[key]
+                                        print(json.dumps(table[key]))
+
 
                     if success and self.__is_show_pkt(pkt):
                         self.__print_packet_info(pkt, cur_pos)
@@ -779,8 +944,6 @@ class TSParser:
                         self.pkt_no += 1
 
             print ('Parse file complete!')
-            import json
-            print(json.dumps(streams, indent=2))
         except IOError as e:
             errno, strerror = e.args
             print ('###### Read file error! error({0}): {1}'.format(errno, strerror) )
