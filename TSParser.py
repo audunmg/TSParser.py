@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 __author__ = 'JiaSong'
 
@@ -8,7 +8,7 @@ PES_START_CODE = 0x010000  # PES分组起始标志0x000001
 CRC32_LEN = 4
 INVALID_VAL = -1
 
-MAX_READ_PKT_NUM = 10000
+MAX_READ_PKT_NUM = 3000
 MAX_CHECK_PKT_NUM = 3
 
 # PID type
@@ -325,6 +325,7 @@ class TSPacket:
     def __init__(self, buf):
         self.buf = buf
         self.ts_header = None
+        self.pusi = None
         self.pid = PID_UNSPEC
         self.cc = INVALID_VAL
         self.pmt_pid = PID_UNSPEC
@@ -338,20 +339,21 @@ class TSPacket:
 
     def parse(self):
         if not self.buf or (TS_PKT_LEN != len(self.buf)):
-            print ('###### Input data length is not 188 bytes!',len(self.buf),self.buf)
+            raise Exception('###### Input data length is not 188 bytes! len %s ' % len(self.buf))
             return False
 
         if TS_SYNC_BYTE != self.buf[0]:
-            print ('###### The first byte of packet is not 0x47!')
+            raise Exception ('###### The first byte of packet is not 0x47!')
             return False
 
         self.ts_header = TSHdrFixedPart.from_buffer_copy(self.buf[0:sizeof(TSHdrFixedPart)])
         self.pid = self.ts_header.pid
         self.cc = self.ts_header.continuity_counter
+        self.pusi = (self.ts_header.payload_unit_start_indicator == 1)
         if self.pid == PID_NULL:
             return True
-        self.payload = self.buf[(sizeof(TSHdrFixedPart)):]
-        if (self.buf[self.__get_payload_offset()] is not 0x00):
+        self.payload = self.buf[(self.__get_table_start_pos()):]
+        if (self.buf[self.__get_payload_offset()] != 0x00):
             self.fragment = True
 
         if self.is_pat():
@@ -374,7 +376,7 @@ class TSPacket:
             self.__parse_pes()
         if self.length == 0:
             self.fragment = True
-            return False
+            return True
         return True
 
     def is_pat(self):
@@ -448,7 +450,9 @@ class TSPacket:
             pos = self.__get_payload_offset()
             # 'pointer_field' field is 1 byte,
             # and whose value is the number of bytes before payload
-            pos += self.buf[pos] + 1
+            # exists only if payload_unit_start_indicator == 1
+            if (self.ts_header.payload_unit_start_indicator == 1):
+                pos += self.buf[pos] + 1
         return pos
 
     def __get_pts(self, option_hdr_pos):
@@ -584,6 +588,7 @@ class TSParser:
                 return sdt
         if pid == PID_EIT:
             if tableid == 0x00:
+                print(payload)
                 eit = {}
                 return eit
 
@@ -591,9 +596,11 @@ class TSParser:
 
 
     def parseSDT(self,payload):
+        print(payload)
         sdt = SDTHdrFixedPart.from_buffer_copy(payload)
         pos = sizeof(SDTHdrFixedPart)
-        tablespace = payload[pos:]
+        tablespace = payload[pos:(sdt.length-1)]
+        print(tablespace)
         pos = 0
         services = {}
         while pos < len(tablespace):
@@ -869,22 +876,31 @@ class TSParser:
             f = open('data.json','wb')
             while True:
                 f.write(json.dumps(streams, indent=2).encode())
+                cur_pos = self.fd.tell()
+                print(self.fd.tell())
                 buf = self.fd.read(read_len)
                 if not buf:
                     break
                 real_len = len(buf)
+                # Careful here. not reading packet by packet.
                 for i in range(0, real_len, TS_PKT_LEN):
+
                     if buf[i] != 0x47:
-                        print ('###### PktNo: %08d, Offset: 0x%08X, Sync byte error!' % (self.pkt_no+1, cur_pos),)
+                        print ('###### PktNo: %08d, Offset: 0x%08X, Sync byte error!' % (self.pkt_no, cur_pos),)
                         print ('First byte<0x%02X>' % buf[i])
                         if not self.__seek_to_first_pkt(cur_pos):
                             print ('###### Seek to next ts packet failed!')
                             exit(-1)
-                        cur_pos = self.fd.tell()
                         break
 
                     pkt = TSPacket(buf[i:i+TS_PKT_LEN])
                     success = pkt.parse()
+                    if success and self.__is_show_pkt(pkt):
+                        self.__print_packet_info(pkt, cur_pos)
+                        cur_pos += TS_PKT_LEN
+                        self.pkt_no += 1
+                    else:
+                        raise Exception("ah shit")
                     for pid in PID:
                         if pkt.pid == pid and need[pid] > 0:
                             pkt.fragment = True
@@ -894,10 +910,11 @@ class TSParser:
                             if pkt.pid == pid and need[pid] > 0:
                                 pkt.fragment = True
                                 if pkt.cc == ((cont[pid]+1)&0xf):
-                                    print("Correct cont", end='')
+                                    #print("Correct cont", end='')
+                                    print ('       %08d, Offset: 0x%08X, PID: 0x%04X Correct fragment, %d/%d\n' % (self.pkt_no -1, cur_pos - TS_PKT_LEN, pid, need[pid], len(pbuf[pid]) ),)
                                     cont[pid] = pkt.cc
                                 else:
-                                    print("\033[31mlost %s package\033[0m, expected %d got %d, discarding partial package" % (pid, cont[pid]+1, pkt.cc))
+                                    print("       \033[31mlost %s package\033[0m, expected %d got %d, discarding partial package" % (pid, cont[pid], pkt.cc))
                                     need[pid] = 0
                                     pbuf[pid] = b''
                                     break
@@ -908,26 +925,30 @@ class TSParser:
                                   pbuf[pid] += pkt.payload[0:(need[pid]+3 )]
                                   need[pid] = 0
                                 if need[pid] <= 0:
-                                    print ('PktNo: %08d, Offset: 0x%08X, ' % (self.pkt_no, cur_pos), end='')
-                                    print ("\033[92mCompleted\033[0m %s packet of \033[1m%d\033[0m bytes" % (pid_name[pid], len(pbuf[pid])) )
+                                    print ('       %08d, Offset: 0x%08X, ' % (self.pkt_no -1, cur_pos - TS_PKT_LEN), end='')
+                                    print ("       \033[92mCompleted\033[0m %s packet of \033[1m%d\033[0m bytes" % (pid_name[pid], len(pbuf[pid])) )
+                                    print (pbuf[pid])
                                     table = self.tableparse(pid, pbuf[pid])
                                     print(table)
                                     for key in table.keys():
                                         streams[pid][key] = table[key]
-
                                     pbuf[pid] = b''
                                     need[pid] = 0
                     else:
                         for pid in PID:
                             if pkt.pid == pid:
-                                print ("\033[1;31m%s\033[0m Len: \033[1m%d\033[0m payload len: %d" % ( pid_name[pid], pkt.length, len(pkt.payload) ) )
-                                if pkt.length > len(pkt.payload[1:]):
-                                    pbuf[pid] = pkt.payload[1:]
-                                    cont[pid] = pkt.cc
-                                    need[pid] = pkt.length - len(pkt.payload[1:])
+                                print ("       \033[1;31m%s\033[0m Len: \033[1m%d\033[0m payload len: %d" % ( pid_name[pid], pkt.length, len(pkt.payload) ) )
+                                if (pkt.length > len(pkt.payload[1:])):
+                                    if not pkt.pusi:
+                                        print("       Somehow fucked.")
+                                        need[pid] = 0
+                                        pbuf[pid] = b''
+                                    else:
+                                        pbuf[pid] = pkt.payload[0:]
+                                        cont[pid] = pkt.cc
+                                        need[pid] = pkt.length - len(pkt.payload[0:])
                                 else:
-
-                                    load = pkt.payload[1:(pkt.length)+4]
+                                    load = pkt.payload[0:(pkt.length)+4]
                                     #print(load)
                                     #print("len load %d, pkt len %d buf len %d" % (len(load), pkt.length, len(pkt.buf)))
                                     table = self.tableparse(pid, load )
@@ -938,10 +959,6 @@ class TSParser:
                                         print(json.dumps(table[key]))
 
 
-                    if success and self.__is_show_pkt(pkt):
-                        self.__print_packet_info(pkt, cur_pos)
-                        cur_pos += TS_PKT_LEN
-                        self.pkt_no += 1
 
             print ('Parse file complete!')
         except IOError as e:
